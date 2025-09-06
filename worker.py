@@ -1,113 +1,97 @@
-import os, time, math, json, traceback
-from datetime import datetime, timezone
-from pymongo import MongoClient, UpdateOne
+# --- construir una malla simple de viga (ribbon) y su deformada ---
+import math
+from datetime import datetime
+from pymongo import MongoClient
+import os
 
-# ====== Config desde ENV ======
-MONGODB_URI   = os.getenv("MONGODB_URI")
-MONGODB_DB    = os.getenv("MONGODB_DB", "biostrucx")
-FEM_CLIENTS   = [c.strip() for c in os.getenv("FEM_CLIENTS", "jeimie").split(",") if c.strip()]
-INTERVAL_SEC  = int(os.getenv("FEM_INTERVAL_SEC", "120"))  # cada 2 min por default
+MONGODB_URI = os.environ["MONGODB_URI"]
+MONGODB_DB  = os.environ.get("MONGODB_DB", "biostrucx")
+CLIENTS     = os.environ.get("FEM_CLIENTS", "jeimie").split(",")
 
-# Geometría/material por defecto (puedes parametrizar por ENV si quieres)
-L = float(os.getenv("FEM_L", "25.0"))   # m
-B = float(os.getenv("FEM_B", "1.0"))    # m
-H = float(os.getenv("FEM_H", "1.0"))    # m
-E = float(os.getenv("FEM_E", "30e9"))   # Pa
-q = float(os.getenv("FEM_Q", "1000"))   # N/m (carga distribuida demo)
+# parámetros básicos de demo (puedes ponerlos en env si quieres)
+L   = 25.0   # largo [m]
+W   = 1.0    # ancho visual del ribbon [m]
+E   = 30e9   # [Pa]
+I   = 0.25**4 / 12.0  # inercia aproximada (m^4) (25 cm ^4 /12, cambia a tu sección)
+q   = 15000.0 # carga distribuida [N/m]
+N   = 60     # divisiones a lo largo (malla Nx*1)
 
-# Malla (resolución del ribbon)
-N = int(os.getenv("FEM_N", "40"))       # nº segmentos a lo largo
+def beam_deflection_uniform(x, L, q, E, I):
+    # viga simplemente apoyada con carga distribuida: w(x) = q x (L^3 - 2 L x^2 + x^3)/(24 E I)
+    return q * x * (L**3 - 2*L*(x**2) + x**3) / (24.0 * E * I)
 
-# ====== Mongo ======
-client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=15000)
-db = client[MONGODB_DB]
-col_result = db["simulation_result"]
-col_ts     = db["simulation_ts"]
+def make_beam_mesh(L=25.0, W=1.0, N=60):
+    # malla rectangular de 2 filas (y = -W/2 y +W/2) y N segmentos a lo largo (x)
+    xs = [L * i / N for i in range(N+1)]
+    ys = [-W/2.0, +W/2.0]
 
-def ts_iso(dt=None):
-    return (dt or datetime.now(timezone.utc)).isoformat()
-
-def make_ribbon_vertices(L, B, H, u_func):
-    """Crea un 'ribbon' (tira) para visualizar la viga y colorear por desplazamiento.
-       Devuelve (vertices, indices, u_mag)."""
+    # vertices: (N+1)*2
     verts = []
-    indices = []
-    u_mag = []
-    halfW = 0.5 * B
+    for x in xs:
+        for y in ys:
+            verts.extend([float(x), float(y), 0.0])  # z=0 plano
 
-    # malla 2 x (N+1) vértices (dos "bordes" del ribbon)
-    for i in range(N + 1):
-        x = L * i / N
-        u = u_func(x)            # desplazamiento (m)
-        y = 0.0
-        z = 0.0
-        # borde inferior/superior del ribbon
-        verts.append([x, y, z])
-        verts.append([x, y, z + halfW])
-        u_mag.append(u)
-        u_mag.append(u)
+    # indices: 2 triángulos por cada quad a lo largo
+    idx = []
+    # índice (i fila y, j columna x):
+    # v(i,j) = j*2 + i  (porque hay 2 filas en y)
+    for j in range(N):
+        v00 = j*2 + 0
+        v01 = j*2 + 1
+        v10 = (j+1)*2 + 0
+        v11 = (j+1)*2 + 1
+        # triángulos (v00, v10, v11) y (v00, v11, v01)
+        idx.extend([v00, v10, v11,  v00, v11, v01])
 
-    # triángulos (dos por cada “cuadrado” a lo largo)
-    for i in range(N):
-        a = 2*i
-        b = 2*i + 1
-        c = 2*(i+1)
-        d = 2*(i+1) + 1
-        indices += [[a,b,c],[b,d,c]]
+    # u_mag por vértice (usa sólo x)
+    u = []
+    for j in range(N+1):
+        x = xs[j]
+        w = beam_deflection_uniform(x, L, q, E, I)  # [m]
+        w_mm = 1000.0 * w                            # pasa a mm
+        # dos filas en y: el mismo valor para ambos
+        u.append(float(w_mm))  # para (j, fila 0)
+        u.append(float(w_mm))  # para (j, fila 1)
 
-    return verts, indices, u_mag
+    # validaciones útiles
+    assert len(verts) % 3 == 0, "vertices debe ser múltiplo de 3"
+    assert len(idx)   % 3 == 0, "indices debe ser múltiplo de 3"
+    assert len(u) == len(verts)//3, "u_mag debe tener N_vertices"
 
-def fem_beam_closed_form(L, E, B, H, q):
-    """FEM 'mínimo viable': analítico de viga simplemente apoyada con carga distribuida."""
-    I = (B * (H**3)) / 12.0
-    def u(x):
-        return (q * x * (L**3 - 2*L*(x**2) + x**3)) / (24.0 * E * I)
-    u_mid = (5.0 * q * (L**4)) / (384.0 * E * I)  # deflexión máx (centro)
-    return u, u_mid
+    return verts, idx, u
 
-def run_for_client(cid):
-    # 1) Resuelve (analítico; si luego migras a OpenSeesPy, cambia aquí)
-    u_func, u_mid = fem_beam_closed_form(L, E, B, H, q)
+def write_result_for(client_id: str):
+    verts, idx, u = make_beam_mesh(L=L, W=W, N=N)
 
-    # 2) Construye malla de visualización (ribbon) y colores por desplazamiento
-    vertices, indices, u_mag = make_ribbon_vertices(L, B, H, u_func)
-
-    # 3) Guarda "latest" para el 3D (simulation_result)
-    now = datetime.now(timezone.utc)
-    doc_result = {
-        "clientid": cid,
-        "ts": now,
-        "status": "done",
-        "params": {"desc":"viga simplemente apoyada", "L":L,"B":B,"H":H,"E":E,"q":q},
-        "model": {"type":"beam"},
+    doc = {
+        "clientid": client_id,
+        "status":   "done",
+        "ts":       datetime.utcnow(),
+        "model":    {"type": "beam_ribbon", "note": "demo uniform load"},
+        "params":   {"L": L, "W": W, "E": E, "I": I, "q": q, "N": N},
         "viz": {
-            "vertices": vertices,   # [[x,y,z], ...]
-            "indices":  indices,    # [[i,j,k], ...] triángulos
-            "u_mag":    u_mag,      # color por desplazamiento
-            "marker":   [L/2, 0, 0]  # posición del sensor (demo)
+            "vertices": verts,        # lista plana [x,y,z,...]
+            "indices":  idx,          # lista plana [i0,i1,i2,...]
+            "u_mag":    u,            # mm para color
+            "marker":   [L*0.25, 0.0, 0.0]  # donde está el sensor (demo)
         }
     }
-    col_result.update_one({"clientid": cid}, {"$set": doc_result}, upsert=True)
 
-    # 4) Inserta punto en la serie (simulation_ts)
-    col_ts.insert_one({
-        "clientid": cid,
-        "ts": now,
-        "fem_mm": float(u_mid*1000.0)  # milímetros
+    cli = MongoClient(MONGODB_URI)
+    db  = cli[MONGODB_DB]
+    db.simulation_result.insert_one(doc)
+
+    # también escribe un punto a la serie temporal (para el gráfico 1)
+    db.simulation_ts.insert_one({
+        "clientid": client_id,
+        "ts": datetime.utcnow(),
+        "fem_mm": float(max(u))  # por ejemplo el máximo en el paso
     })
 
-def main_loop():
-    print("[worker] starting… clients=", FEM_CLIENTS, "every", INTERVAL_SEC, "sec")
-    # conexión sanity-check
-    client.admin.command("ping")
-    while True:
-        try:
-            for cid in FEM_CLIENTS:
-                run_for_client(cid)
-        except Exception as e:
-            traceback.print_exc()
-        time.sleep(INTERVAL_SEC)
+    print(f"[worker] wrote viz: V={len(verts)//3} verts, T={len(idx)//3} tris, max={max(u):.3f} mm")
 
+# --- bucle simple (o deja tu cron actual) ---
 if __name__ == "__main__":
-    main_loop()
+    for cid in [c.strip() for c in CLIENTS if c.strip()]:
+        write_result_for(cid)
 
