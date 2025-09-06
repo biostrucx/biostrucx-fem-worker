@@ -1,233 +1,200 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-BioStrucX – FEM Worker (demo beam)
-- Calcula una viga simplemente apoyada con carga distribuida (analítico).
-- Guarda:
-    * biostrucx.simulation_result: malla + colores (viz) y metadatos
-    * biostrucx.simulation_ts: serie temporal fem_mm
-
-Variables de entorno:
-    MONGODB_URI           (obligatoria)
-    MONGODB_DB            (por defecto: biostrucx)
-    FEM_CLIENTS           (coma-sep, ej: "jeimie,client2"; por defecto: "jeimie")
-    FEM_INTERVAL_SEC      (por defecto: 120)
-
-Parámetros (opcionales) del modelo:
-    FEM_L, FEM_B, FEM_H, FEM_E, FEM_Q, FEM_N, FEM_W
-"""
-
-import os
-import time
-import math
+# worker.py
+import os, time, math, json
 from datetime import datetime, timezone
+from pymongo import MongoClient, ASCENDING, DESCENDING, errors
 
-from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.errors import OperationFailure, PyMongoError
+try:
+    # Intentar OpenSeesPy; si no está, caemos al analítico
+    import openseespy.opensees as ops
+    HAS_OPS = True
+except Exception:
+    HAS_OPS = False
 
-# ==========================
-# Config de entorno
-# ==========================
-MONGO_URI = os.getenv("MONGODB_URI") or os.getenv("MONGODB_URI".lower()) or os.getenv("mongodb_uri")
-MONGO_DB = os.getenv("MONGODB_DB", "biostrucx")
+# ===== Parámetros por defecto (puedes sobreescribir con ENV) =====
+MONGO_URI   = os.getenv("MONGODB_URI", "")
+MONGO_DB    = os.getenv("MONGODB_DB", "biostrucx")
+CLIENTS     = [c.strip() for c in os.getenv("FEM_CLIENTS", "jeimie").split(",") if c.strip()]
+INTERVAL_S  = int(os.getenv("FEM_INTERVAL_SEC", "120"))
 
-CLIENTS = [c.strip() for c in (os.getenv("FEM_CLIENTS") or "jeimie").split(",") if c.strip()]
-INTERVAL_SEC = int(os.getenv("FEM_INTERVAL_SEC", "120"))
+# Geometría/propiedades del demo (m)
+L = float(os.getenv("FEM_L", "25"))      # largo
+B = float(os.getenv("FEM_B", "0.25"))    # ancho “visual” del ribbon (no sección)
+H = float(os.getenv("FEM_H", "1.0"))     # alto (para I)
+E = float(os.getenv("FEM_E", str(30e9))) # Pa
+rho = 2500.0
+q_kNpm = float(os.getenv("FEM_W", "15")) # carga distribuida (kN/m)
+q = q_kNpm * 1e3                         # N/m
 
-# Parámetros de la viga (unidades SI)
-L = float(os.getenv("FEM_L", "25.0"))           # longitud (m)
-B = float(os.getenv("FEM_B", "0.25"))           # base sección (m)
-H = float(os.getenv("FEM_H", "0.25"))           # altura sección (m)
-E = float(os.getenv("FEM_E", "2.1e11"))         # módulo E (Pa)
-Q = float(os.getenv("FEM_Q", "15000"))          # carga distribuida (N/m), p.ej. 15 kN/m
-N = int(os.getenv("FEM_N", "80"))               # segmentos de malla (>= 2)
-W = float(os.getenv("FEM_W", "0.40"))           # ancho visual del “ribbon” (m) para render
+# Malla de visualización
+N = int(os.getenv("FEM_N", "80"))        # divisiones a lo largo (>= 2)
+Wdiv = int(os.getenv("FEM_WDIV", "8"))   # divisiones a lo ancho (>= 2)
+SENSOR_X_FRACTION = float(os.getenv("FEM_SENSOR_X", "0.65")) # x del marcador
 
-# ==========================
-# Conexión Mongo + índices
-# ==========================
-def get_db():
-    if not MONGO_URI:
-        raise RuntimeError("Falta MONGODB_URI")
+# Escala de deformada para que “se vea”
+DEF_SCALE = float(os.getenv("FEM_DEF_SCALE", "30.0"))
 
-    cli = MongoClient(MONGO_URI)
+def mongo():
+    cli = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
     db = cli[MONGO_DB]
-
-    # Crea el MISMO nombre de índice en ambas colecciones.
-    # Si ya existe con otro nombre, capturamos code=85 (IndexOptionsConflict) y seguimos.
-    try:
-        db.simulation_result.create_index(
-            [("clientid", ASCENDING), ("ts", DESCENDING)],
-            name="idx_clientid_ts",
-            background=True,
-        )
-    except OperationFailure as e:
-        if getattr(e, "code", None) != 85:
-            raise
-
-    try:
-        db.simulation_ts.create_index(
-            [("clientid", ASCENDING), ("ts", DESCENDING)],
-            name="idx_clientid_ts",
-            background=True,
-        )
-    except OperationFailure as e:
-        if getattr(e, "code", None) != 85:
-            raise
-
     return db
 
+def ensure_indexes(db):
+    # Evita chocar con índices ya existentes
+    try:
+        db["simulation_result"].create_index([("clientid", ASCENDING), ("ts", DESCENDING)])
+    except errors.OperationFailure:
+        pass
+    try:
+        db["simulation_ts"].create_index([("clientid", ASCENDING), ("ts", DESCENDING)])
+    except errors.OperationFailure:
+        pass
 
-# ==========================
-# Modelo demo de viga (analítico)
-# ==========================
-def beam_deflection_udl(x, L, E, I, q):
-    """
-    Deflexión w(x) de viga simplemente apoyada con carga distribuida uniforme q (N/m).
-    E en Pa, I en m^4, resultado en metros.
-    Fórmula clásica: w(x) = q x (L^3 - 2 L x^2 + x^3) / (24 E I)
-    """
-    return (q * x * (L**3 - 2.0 * L * (x**2) + x**3)) / (24.0 * E * I)
+# ====== Modelo simple: viga simplemente apoyada con q ======
+def deflection_analytic(x):
+    # w(x) en metros (teoría vigas Euler-Bernoulli)
+    I = (B * (H**3)) / 12.0
+    # fórmula: q*x*(L^3 - 2*L*x^2 + x^3) / (24*E*I)
+    return (q * x * (L**3 - 2*L*(x**2) + x**3)) / (24.0 * E * I)
 
+def deflection_opensees():
+    # Discretización lineal para sacar forma modal estática
+    if not HAS_OPS:
+        return None
+    try:
+        ndm, ndf = 2, 3
+        ops.wipe()
+        ops.model('basic', '-ndm', ndm, '-ndf', ndf)
 
-def build_beam_ribbon(L, W, N, E, B, H, q):
-    """
-    Construye una “malla cinta” (ribbon) a lo largo de X, ancho W (en Y).
-    - vertices: [x,y,z, x,y,z, ...]  (len % 3 == 0)
-    - indices: [i0,i1,i2, ...]       (triángulos; len % 3 == 0)
-    - u_mag:   [mm por vértice]      (len == num_vertices/3)
-    - marker:  [xm, ym, zm]          (punto de interés; aquí, midspan)
-    La coordenada z se deforma con la deflexión analítica.
-    """
-    N = max(2, int(N))
-    I = (B * (H**3)) / 12.0  # inercia rectangular
+        # Nnod = N+1
+        for i in range(N + 1):
+            x = L * i / N
+            ops.node(i + 1, x, 0.0)
 
-    xs = [L * i / N for i in range(N + 1)]
-    half_w = W / 2.0
+        # apoyos simples en 1 y N+1
+        ops.fix(1, 1, 1, 0)            # empotramiento parcial (u=v=0, libre rot)
+        ops.fix(N + 1, 1, 1, 0)
 
+        # sección equivalente (elasticBeamColumn 2D)
+        A = B * H
+        I = (B * (H**3)) / 12.0
+        ops.uniaxialMaterial('Elastic', 1, E)
+        ops.section('Elastic', 1, E, A, I)
+
+        # Elementos
+        for i in range(1, N + 1):
+            ops.element('elasticBeamColumn', i, i, i + 1, A, E, I, 1)
+
+        # Carga distribuida (equivalente nodal)
+        ops.timeSeries('Linear', 1)
+        ops.pattern('Plain', 1, 1)
+        w = -q  # hacia abajo
+        # repartir como puntuales: cada tramo L/N con carga w*(L/N)
+        p = w * (L / N)
+        for i in range(2, N):  # no cargar apoyos
+            ops.load(i, 0.0, p, 0.0)
+
+        ops.system('BandGeneral')
+        ops.numberer('RCM')
+        ops.constraints('Plain')
+        ops.algorithm('Linear')
+        ops.integrator('LoadControl', 1.0)
+        ops.analysis('Static')
+        ops.analyze(1)
+
+        w_def = []
+        for i in range(N + 1):
+            ntag = i + 1
+            ux = ops.nodeDisp(ntag, 1)
+            uy = ops.nodeDisp(ntag, 2)
+            # usamos uy (vertical) como “deflexión” (metros)
+            w_def.append(uy)
+        return w_def
+    except Exception:
+        return None
+
+def build_viz():
+    # 1) deflexión a lo largo
+    w_def = deflection_opensees()
+    if w_def is None:
+        # analítico
+        w_def = [deflection_analytic(L * i / N) for i in range(N + 1)]
+
+    # 2) construir malla ribbon N×Wdiv
     vertices = []
     u_mag = []
+    for i in range(N + 1):
+        x = L * i / N
+        w = w_def[i] * DEF_SCALE            # amplificado para verlo
+        for j in range(Wdiv + 1):
+            t = j / Wdiv                    # 0..1
+            y = (t - 0.5) * B               # centrado en 0
+            z = w                           # deformada en z
+            vertices.extend([x, y, z])
+            u_mag.append(abs(w_def[i] * 1000.0))  # magnitud real en mm (para color)
 
-    # 2 vértices por "sección": y = -half_w y y = +half_w
-    for x in xs:
-        w = beam_deflection_udl(x, L, E, I, q)  # metros (positivo hacia abajo)
-        z = -w                                  # sign: hacia abajo negativo (opcional)
-        mm = w * 1000.0
-
-        # lado -W/2
-        vertices.extend([x, -half_w, z])
-        u_mag.append(float(mm))
-
-        # lado +W/2
-        vertices.extend([x, +half_w, z])
-        u_mag.append(float(mm))
-
-    # Triángulos entre dos franjas consecutivas
-    # Para cada i: (i*2, i*2+1, i*2+2) y (i*2+1, i*2+3, i*2+2)
+    # Triangulación
     indices = []
+    stride = Wdiv + 1
     for i in range(N):
-        a = i * 2
-        b = a + 1
-        c = a + 2
-        d = a + 3
-        indices.extend([a, b, c])
-        indices.extend([b, d, c])
+        for j in range(Wdiv):
+            a = i * stride + j
+            b = a + 1
+            c = (i + 1) * stride + j
+            d = c + 1
+            # dos triángulos por quad
+            indices.extend([a, c, b])
+            indices.extend([b, c, d])
 
-    # Punto de interés (midspan)
-    xmid = L / 2.0
-    wmid = beam_deflection_udl(xmid, L, E, I, q)
-    marker = [xmid, 0.0, -wmid]
+    # Marcador (posición del sensor)
+    xs = SENSOR_X_FRACTION * L
+    # buscamos z en esa x:
+    k = min(range(N + 1), key=lambda ii: abs(L * ii / N - xs))
+    z_marker = w_def[k] * DEF_SCALE
+    marker = [xs, 0.0, z_marker]
 
-    # Validaciones mínimas (evitan subir algo “roto”)
-    assert len(vertices) % 3 == 0, "vertices debe ser múltiplo de 3"
-    assert len(indices) % 3 == 0, "indices debe ser múltiplo de 3"
-    assert len(u_mag) == len(vertices) // 3, "u_mag debe tener N_vértices"
+    return vertices, indices, u_mag, marker, max(abs(v) for v in w_def) * 1000.0 # max mm
 
-    # Desplazamiento (mm) en el medio de la luz, útil para la serie temporal
-    mid_mm = float(wmid * 1000.0)
-    return vertices, indices, u_mag, marker, mid_mm
+def run_once(db, clientid):
+    now = datetime.now(timezone.utc)
 
+    vertices, indices, u_mag, marker, max_mm = build_viz()
 
-# ==========================
-# Ejecución por cliente
-# ==========================
-def run_for_client(db, clientid: str):
-    """
-    Calcula la viga demo, guarda en:
-      - simulation_result (documento con viz)
-      - simulation_ts (punto fem_mm)
-    """
-    ts_now = datetime.now(timezone.utc)
-
-    try:
-        vertices, indices, u_mag, marker, mid_mm = build_beam_ribbon(
-            L=L, W=W, N=N, E=E, B=B, H=H, q=Q
-        )
-
-        doc_result = {
-            "clientid": clientid,
-            "model": {"type": "beam_demo"},
-            "params": {
-                "L": L, "B": B, "H": H, "E": E, "q": Q, "N": N, "W": W
-            },
-            "status": "done",
-            "ts": ts_now,
-            "viz": {
-                "vertices": [float(v) for v in vertices],
-                "indices": [int(i) for i in indices],
-                "u_mag":   [float(v) for v in u_mag],
-                "marker":  [float(x) for x in marker],
-            },
+    # documento principal (para el visor)
+    doc = {
+        "clientid": clientid,
+        "status": "done",
+        "ts": now,
+        "model": {
+            "type": "beam_demo",
+            "L_m": L, "B_m": B, "H_m": H, "E_Pa": E, "q_Npm": q
+        },
+        "params": {},
+        "viz": {
+            "vertices": vertices,   # float[]
+            "indices": indices,     # int[] (triángulos)
+            "u_mag": u_mag,         # float[] (mm por vértice)
+            "marker": marker        # [x,y,z]
         }
+    }
+    db["simulation_result"].insert_one(doc)
 
-        # Insert resultado + timeseries
-        db.simulation_result.insert_one(doc_result)
-        db.simulation_ts.insert_one({
-            "ts": ts_now,
-            "clientid": clientid,
-            "fem_mm": float(mid_mm),
-        })
+    # punto de serie temporal (máx deflexión en mm)
+    db["simulation_ts"].insert_one({
+        "ts": now, "clientid": clientid, "fem_mm": float(max_mm)
+    })
 
-        print(f"[worker] {clientid} ok | fem_mm={mid_mm:.3f} mm")
-
-    except AssertionError as e:
-        print(f"[worker] {clientid} viz assertion error: {e}")
-        db.simulation_result.insert_one({
-            "clientid": clientid,
-            "status": "error",
-            "error": f"viz_assert: {str(e)}",
-            "ts": ts_now,
-        })
-    except PyMongoError as e:
-        print(f"[worker] {clientid} mongo error: {e}")
-    except Exception as e:
-        print(f"[worker] {clientid} general error: {e}")
-        db.simulation_result.insert_one({
-            "clientid": clientid,
-            "status": "error",
-            "error": f"runtime: {str(e)}",
-            "ts": ts_now,
-        })
-
-
-# ==========================
-# Main loop
-# ==========================
 def main():
-    print(f"[worker] starting.. clients={CLIENTS} every {INTERVAL_SEC} sec")
-    db = get_db()
+    db = mongo()
+    ensure_indexes(db)
 
+    print(f"[worker] starting… clients={CLIENTS} every {INTERVAL_S} sec")
     while True:
-        start = time.time()
         for cid in CLIENTS:
-            run_for_client(db, cid)
-
-        # Sleep hasta completar el intervalo, respetando tiempo de ejecución
-        spent = time.time() - start
-        to_sleep = max(1.0, INTERVAL_SEC - spent)
-        time.sleep(to_sleep)
-
+            try:
+                run_once(db, cid)
+            except Exception as e:
+                print("[worker] error:", e)
+        time.sleep(INTERVAL_S)
 
 if __name__ == "__main__":
     main()
