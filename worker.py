@@ -58,26 +58,35 @@ def deflection_opensees():
         ops.wipe()
         ops.model('basic', '-ndm', ndm, '-ndf', ndf)
 
+        # nodos a lo largo de la viga
         for i in range(N + 1):
-            ops.node(i + 1, L * i / N, 0.0)
+            x = L * i / N
+            ops.node(i + 1, x, 0.0)
 
-        # apoyos simples (u=v=0, libre rot)
-        ops.fix(1, 1, 1, 0)
+        # apoyos simples (u=v=0, rot libre)
+        ops.fix(1,     1, 1, 0)
         ops.fix(N + 1, 1, 1, 0)
 
+        # sección equivalente y propiedades
         A = B * H
         I = (B * (H**3)) / 12.0
-        ops.uniaxialMaterial('Elastic', 1, E)
-        ops.section('Elastic', 1, E, A, I)
+
+        # *** ESTA LÍNEA FALTABA ***
+        # Transformation para elementos en 2D (Lineal o PDelta)
+        ops.geomTransf('Linear', 1)
+
+        # elementos viga elástica (usa el transfTag = 1)
         for i in range(1, N + 1):
             ops.element('elasticBeamColumn', i, i, i + 1, A, E, I, 1)
 
+        # carga distribuida (aprox. con puntuales nodales)
         ops.timeSeries('Linear', 1)
         ops.pattern('Plain', 1, 1)
-        p = -q * (L / N)  # equivalente nodal
-        for i in range(2, N):  # no cargar los apoyos
+        p = -q * (L / N)  # N por nodo (hacia abajo)
+        for i in range(2, N):  # evita cargar apoyos
             ops.load(i, 0.0, p, 0.0)
 
+        # análisis estático lineal
         ops.system('BandGeneral')
         ops.numberer('RCM')
         ops.constraints('Plain')
@@ -86,13 +95,14 @@ def deflection_opensees():
         ops.analysis('Static')
         ops.analyze(1)
 
-        w_def = []
-        for i in range(N + 1):
-            uy = ops.nodeDisp(i + 1, 2)  # vertical
-            w_def.append(uy)
+        # deflexión vertical uy en cada nodo
+        w_def = [ops.nodeDisp(i + 1, 2) for i in range(N + 1)]
         return w_def
+
     except Exception:
+        # si algo falla, deja que el caller use el analítico
         return None
+
 
 def build_viz():
     # 1) deflexión eje neutro
