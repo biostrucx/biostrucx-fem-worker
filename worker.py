@@ -194,13 +194,15 @@ def build_viz():
             d = vidx(N, j,     k + 1)
             add_quad(d, c, b, a)
 
-    # 4) marcador (centro del espesor)
-    xs = SENSOR_X_FRACTION * L
-    k_near = min(range(N + 1), key=lambda ii: abs(L * ii / N - xs))
-    z_marker = w_def[k_near] * DEF_SCALE
-    marker = [xs, 0.0, z_marker]
+# 4) marcador (fibra inferior en L/2)
+xs = 0.5 * L  # posición a mitad de luz
+k_near = min(range(N + 1), key=lambda ii: abs(L * ii / N - xs))
 
-    max_mm = max(abs(v) for v in w_def) * 1000.0
+halfH = (H * THICK_SCALE) * 0.5
+z_marker = w_def[k_near] * DEF_SCALE - halfH - 1e-6   # mover a la parte inferior
+
+marker = [xs, 0.0, z_marker]
+
 
     return vertices, indices, u_mag, marker, max_mm
 
