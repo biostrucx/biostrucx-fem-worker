@@ -48,7 +48,7 @@ def ensure_indexes(db):
 # ---- Viga simplemente apoyada con carga distribuida q ----
 def deflection_analytic(x):
     I = (B * (H**3)) / 12.0
-    return (q * x * (L**3 - 2*L*(x**2) + x**3)) / (24.0 * E * I)
+    return (q * x * (L**3) - 2*q*L*(x**3) + q*(x**4)) / (24.0 * E * I)
 
 def deflection_opensees():
     if not HAS_OPS:
@@ -71,8 +71,7 @@ def deflection_opensees():
         A = B * H
         I = (B * (H**3)) / 12.0
 
-        # *** ESTA LÍNEA FALTABA ***
-        # Transformation para elementos en 2D (Lineal o PDelta)
+        # Transformation para elementos en 2D
         ops.geomTransf('Linear', 1)
 
         # elementos viga elástica (usa el transfTag = 1)
@@ -102,7 +101,6 @@ def deflection_opensees():
     except Exception:
         # si algo falla, deja que el caller use el analítico
         return None
-
 
 def build_viz():
     # 1) deflexión eje neutro
@@ -194,16 +192,14 @@ def build_viz():
             d = vidx(N, j,     k + 1)
             add_quad(d, c, b, a)
 
-# 4) marcador (fibra inferior en L/2)
-xs = 0.5 * L  # posición a mitad de luz
-k_near = min(range(N + 1), key=lambda ii: abs(L * ii / N - xs))
+    # 4) marcador (fibra inferior en L/2)
+    xs = 0.5 * L  # posición a mitad de luz
+    k_near = min(range(N + 1), key=lambda ii: abs(L * ii / N - xs))
+    # halfH ya calculado arriba
+    z_marker = w_def[k_near] * DEF_SCALE - halfH - 1e-6   # llevarlo a la cara inferior
+    marker = [xs, 0.0, z_marker]
 
-halfH = (H * THICK_SCALE) * 0.5
-z_marker = w_def[k_near] * DEF_SCALE - halfH - 1e-6   # mover a la parte inferior
-
-marker = [xs, 0.0, z_marker]
-
-
+    max_mm = max(abs(v) for v in w_def) * 1000.0
     return vertices, indices, u_mag, marker, max_mm
 
 def run_once(db, clientid):
@@ -235,8 +231,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
