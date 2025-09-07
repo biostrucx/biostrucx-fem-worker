@@ -1,239 +1,262 @@
-# worker.py
-import os, time, math, json
-from datetime import datetime, timezone
-from pymongo import MongoClient, ASCENDING, DESCENDING, errors
+// src/components/FEMViewer.jsx
+import React, { useEffect, useRef } from "react";
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-try:
-    import openseespy.opensees as ops
-    HAS_OPS = True
-except Exception:
-    HAS_OPS = False
+// Colormap sencillo: azul → magenta → rojo
+function colorMap(t) {
+  const clamp = (x) => Math.max(0, Math.min(1, x));
+  t = clamp(t);
+  const r = clamp(1.6 * t);
+  const g = clamp(0.2 * (1 - Math.abs(t - 0.5) * 2));
+  const b = clamp(1.0 * (1 - t) + 0.2 * (1 - Math.abs(t - 0.5) * 2));
+  return new THREE.Color(r, g, b);
+}
 
-# ===== Config =====
-MONGO_URI   = os.getenv("MONGODB_URI", "")
-MONGO_DB    = os.getenv("MONGODB_DB", "biostrucx")
-CLIENTS     = [c.strip() for c in os.getenv("FEM_CLIENTS", "jeimie").split(",") if c.strip()]
-INTERVAL_S  = int(os.getenv("FEM_INTERVAL_SEC", "120"))
+/**
+ * Props:
+ *  - viz: { vertices:number[], indices:number[], u_mag?:number[], marker?:[x,y,z] }
+ *  - marker?: [x,y,z]
+ *  - height?: number
+ *  - showMesh?: boolean  (nuevo: true por defecto)
+ *  - meshOpacity?: number (0..1, default 0.18)
+ */
+export default function FEMViewer({
+  viz,
+  marker,
+  height = 220,
+  showMesh = true,
+  meshOpacity = 0.18,
+}) {
+  const wrapRef = useRef(null);
+  const rendererRef = useRef(null);
+  const sceneRef = useRef(new THREE.Scene());
+  const cameraRef = useRef(null);
+  const controlsRef = useRef(null);
 
-# Geometría / propiedades (m, Pa, N/m)
-L = float(os.getenv("FEM_L", "25"))
-B = float(os.getenv("FEM_B", "0.25"))      # ancho (eje y)
-H = float(os.getenv("FEM_H", "0.35"))       # “espesor” visual (altura)
-E = float(os.getenv("FEM_E", str(30e9)))
-rho = 2500.0
-q_kNpm = float(os.getenv("FEM_W", "15"))
-q = q_kNpm * 1e3
+  const meshRef = useRef(null);
+  const wireRef = useRef(null);   // NUEVO: capa wireframe
+  const markerRef = useRef(null);
 
-# Discretización
-N     = int(os.getenv("FEM_N", "80"))      # a lo largo (x) -> N segmentos, N+1 nodos
-Wdiv  = int(os.getenv("FEM_WDIV", "8"))    # a lo ancho (y)
-Hdiv  = int(os.getenv("FEM_HDIV", "4"))    # a lo alto (espesor “vertical” alrededor de la deformada)
-SENSOR_X_FRACTION = float(os.getenv("FEM_SENSOR_X", "0.65"))
+  const animRef = useRef(0);
 
-# Escalas visuales
-DEF_SCALE      = float(os.getenv("FEM_DEF_SCALE", "30.0"))  # amplifica la deformada
-THICK_SCALE    = float(os.getenv("FEM_THICK_SCALE", "2.0")) # factor visual del espesor H (1=real)
+  // init
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    const scene = sceneRef.current;
 
-def mongo():
-    cli = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
-    return cli[MONGO_DB]
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setClearAlpha(0);
+    wrap.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
 
-def ensure_indexes(db):
-    for name in ("simulation_result","simulation_ts"):
-        try:
-            db[name].create_index([("clientid", ASCENDING), ("ts", DESCENDING)])
-        except errors.OperationFailure:
-            pass
+    const cam = new THREE.PerspectiveCamera(35, 1, 0.01, 1000);
+    cameraRef.current = cam;
+    scene.add(cam);
 
-# ---- Viga simplemente apoyada con carga distribuida q ----
-def deflection_analytic(x):
-    I = (B * (H**3)) / 12.0
-    return (q * x * (L**3 - 2*L*(x**2) + x**3)) / (24.0 * E * I)
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x111111, 0.9);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.85);
+    dir.position.set(2, 3, 2);
+    cam.add(dir);
 
-def deflection_opensees():
-    if not HAS_OPS:
-        return None
-    try:
-        ndm, ndf = 2, 3
-        ops.wipe()
-        ops.model('basic', '-ndm', ndm, '-ndf', ndf)
+    const controls = new OrbitControls(cam, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controlsRef.current = controls;
 
-        # nodos a lo largo de la viga
-        for i in range(N + 1):
-            x = L * i / N
-            ops.node(i + 1, x, 0.0)
+    const onResize = () => {
+      const w = wrap.clientWidth;
+      const h = wrap.clientHeight;
+      renderer.setSize(w, h, false);
+      cam.aspect = Math.max(1e-6, w / h);
+      cam.updateProjectionMatrix();
+      if (meshRef.current) frameObject(meshRef.current);
+    };
+    onResize();
+    window.addEventListener("resize", onResize);
 
-        # apoyos simples (u=v=0, rot libre)
-        ops.fix(1,     1, 1, 0)
-        ops.fix(N + 1, 1, 1, 0)
+    const tick = () => {
+      controls.update();
+      renderer.render(scene, cam);
+      animRef.current = requestAnimationFrame(tick);
+    };
+    tick();
 
-        # sección equivalente y propiedades
-        A = B * H
-        I = (B * (H**3)) / 12.0
+    return () => {
+      cancelAnimationFrame(animRef.current);
+      window.removeEventListener("resize", onResize);
+      controls.dispose();
+      renderer.dispose();
+      if (renderer.domElement.parentNode) {
+        renderer.domElement.parentNode.removeChild(renderer.domElement);
+      }
+      // limpiar objetos
+      [meshRef.current, wireRef.current, markerRef.current].forEach((o) => {
+        if (o) scene.remove(o);
+      });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-        # *** ESTA LÍNEA FALTABA ***
-        # Transformation para elementos en 2D (Lineal o PDelta)
-        ops.geomTransf('Linear', 1)
+  // Construir/actualizar la geometría
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!viz || !viz.vertices || !viz.indices) return;
 
-        # elementos viga elástica (usa el transfTag = 1)
-        for i in range(1, N + 1):
-            ops.element('elasticBeamColumn', i, i, i + 1, A, E, I, 1)
+    // limpiar anterior
+    if (meshRef.current) scene.remove(meshRef.current);
+    if (wireRef.current) scene.remove(wireRef.current);
 
-        # carga distribuida (aprox. con puntuales nodales)
-        ops.timeSeries('Linear', 1)
-        ops.pattern('Plain', 1, 1)
-        p = -q * (L / N)  # N por nodo (hacia abajo)
-        for i in range(2, N):  # evita cargar apoyos
-            ops.load(i, 0.0, p, 0.0)
+    const verts = Array.isArray(viz.vertices[0]) ? viz.vertices.flat() : viz.vertices;
+    const idx = viz.indices;
 
-        # análisis estático lineal
-        ops.system('BandGeneral')
-        ops.numberer('RCM')
-        ops.constraints('Plain')
-        ops.algorithm('Linear')
-        ops.integrator('LoadControl', 1.0)
-        ops.analysis('Static')
-        ops.analyze(1)
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+    geom.setIndex(idx);
 
-        # deflexión vertical uy en cada nodo
-        w_def = [ops.nodeDisp(i + 1, 2) for i in range(N + 1)]
-        return w_def
+    // Colores por vértice si u_mag disponible
+    let material;
+    if (Array.isArray(viz.u_mag) && viz.u_mag.length * 3 === verts.length) {
+      const vals = viz.u_mag.map(Number).filter(Number.isFinite);
+      const vmin = Math.min(...vals);
+      const vmax = Math.max(...vals);
+      const colors = new Float32Array(viz.u_mag.length * 3);
+      for (let i = 0; i < viz.u_mag.length; i++) {
+        const t = vmax - vmin > 1e-8 ? (viz.u_mag[i] - vmin) / (vmax - vmin) : 0.5;
+        const c = colorMap(t);
+        colors[i * 3] = c.r;
+        colors[i * 3 + 1] = c.g;
+        colors[i * 3 + 2] = c.b;
+      }
+      geom.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+      material = new THREE.MeshStandardMaterial({
+        side: THREE.DoubleSide,
+        flatShading: true,
+        vertexColors: true,
+        metalness: 0.0,
+        roughness: 0.9,
+      });
+    } else {
+      material = new THREE.MeshStandardMaterial({
+        color: 0x7aa2ff,
+        side: THREE.DoubleSide,
+        flatShading: true,
+        metalness: 0.0,
+        roughness: 0.9,
+      });
+    }
 
-    except Exception:
-        # si algo falla, deja que el caller use el analítico
-        return None
+    const mesh = new THREE.Mesh(geom, material);
+    scene.add(mesh);
+    meshRef.current = mesh;
 
+    // === NUEVO: Wireframe (malla) con todas las aristas ===
+    if (showMesh) {
+      const wfGeom = new THREE.WireframeGeometry(geom); // incluye TODAS las aristas
+      const wfMat = new THREE.LineBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: meshOpacity, // sutil
+      });
+      const wf = new THREE.LineSegments(wfGeom, wfMat);
+      scene.add(wf);
+      wireRef.current = wf;
+    }
 
-def build_viz():
-    # 1) deflexión eje neutro
-    w_def = deflection_opensees()
-    if w_def is None:
-        w_def = [deflection_analytic(L * i / N) for i in range(N + 1)]
+    frameObject(mesh);
+    updateMarker();
 
-    # 2) malla volumétrica tipo prisma rectangular:
-    #    ejes: x (largo), y (ancho B), z (vertical = deformada + espesor)
-    Ny = Wdiv + 1
-    Nz = Hdiv + 1
-    stride_x = Ny * Nz
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viz, showMesh, meshOpacity]);
 
-    def vidx(i, j, k):
-        return i * stride_x + j * Nz + k
+  // marcador
+  useEffect(() => {
+    updateMarker();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [marker]);
 
-    vertices = []
-    u_mag = []
+  function frameObject(object3D) {
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
 
-    # pre-cálculos
-    halfB = B * 0.5
-    halfH = (H * THICK_SCALE) * 0.5
+    const box = new THREE.Box3().setFromObject(object3D);
+    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    const center = sphere.center;
+    const r = Math.max(sphere.radius, 1e-3);
 
-    for i in range(N + 1):
-        x = L * i / N
-        w = w_def[i] * DEF_SCALE              # deformada visual
-        mm = abs(w_def[i]) * 1000.0           # mm reales (para color)
+    const fov = THREE.MathUtils.degToRad(camera.fov);
+    const dist = r / Math.sin(fov / 2);
 
-        for j in range(Ny):                   # ancho
-            y = -halfB + (B * j / Wdiv)
-            for k in range(Nz):               # espesor “vertical” alrededor de w
-                h = -halfH + (2 * halfH * k / Hdiv)
-                z = w + h                     # top/bottom alrededor de la deformada
-                vertices.extend([x, y, z])
-                u_mag.append(mm)
+    camera.near = r / 100;
+    camera.far = r * 100;
+    camera.updateProjectionMatrix();
 
-    indices = []
+    camera.position.set(center.x + dist * 0.9, center.y + dist * 0.6, center.z + dist * 0.9);
+    controls.target.copy(center);
+    controls.minDistance = r * 0.2;
+    controls.maxDistance = r * 20;
+    controls.update();
+  }
 
-    def add_quad(a, b, c, d):
-        # dos triángulos: a-b-c y a-c-d
-        indices.extend([a, b, c, a, c, d])
+  function updateMarker() {
+    const scene = sceneRef.current;
+    const m = marker || viz?.marker;
+    if (!m || m.length < 3 || !meshRef.current) {
+      if (markerRef.current) {
+        scene.remove(markerRef.current);
+        markerRef.current = null;
+      }
+      return;
+    }
 
-    # 3) carcasas:
-    # top (k=Hdiv) y bottom (k=0)
-    for i in range(N):
-        for j in range(Wdiv):
-            # top
-            a = vidx(i,     j,     Hdiv)
-            b = vidx(i + 1, j,     Hdiv)
-            c = vidx(i + 1, j + 1, Hdiv)
-            d = vidx(i,     j + 1, Hdiv)
-            add_quad(a, b, c, d)
-            # bottom
-            a = vidx(i,     j,     0)
-            b = vidx(i + 1, j,     0)
-            c = vidx(i + 1, j + 1, 0)
-            d = vidx(i,     j + 1, 0)
-            add_quad(d, c, b, a)  # invertido para normal opuesta
+    const box = new THREE.Box3().setFromObject(meshRef.current);
+    const r = Math.max(box.getBoundingSphere(new THREE.Sphere()).radius, 1e-3);
 
-    # lados y = -B/2 y y = +B/2
-    for i in range(N):
-        for k in range(Hdiv):
-            # lado -Y (j=0)
-            a = vidx(i,     0, k)
-            b = vidx(i + 1, 0, k)
-            c = vidx(i + 1, 0, k + 1)
-            d = vidx(i,     0, k + 1)
-            add_quad(d, c, b, a)
-            # lado +Y (j=Wdiv)
-            a = vidx(i,     Wdiv, k)
-            b = vidx(i + 1, Wdiv, k)
-            c = vidx(i + 1, Wdiv, k + 1)
-            d = vidx(i,     Wdiv, k + 1)
-            add_quad(a, b, c, d)
+    const geo = new THREE.SphereGeometry(r * 0.03, 24, 24);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xff4444,
+      emissive: 0xaa0000,
+      emissiveIntensity: 0.8,
+    });
+    const sph = new THREE.Mesh(geo, mat);
+    sph.position.set(m[0], m[1], m[2]);
 
-    # tapas (opcional): i=0 y i=N para cerrar extremos
-    for j in range(Wdiv):
-        for k in range(Hdiv):
-            # i=0
-            a = vidx(0, j,     k)
-            b = vidx(0, j + 1, k)
-            c = vidx(0, j + 1, k + 1)
-            d = vidx(0, j,     k + 1)
-            add_quad(a, b, c, d)
-            # i=N
-            a = vidx(N, j,     k)
-            b = vidx(N, j + 1, k)
-            c = vidx(N, j + 1, k + 1)
-            d = vidx(N, j,     k + 1)
-            add_quad(d, c, b, a)
+    if (markerRef.current) scene.remove(markerRef.current);
+    scene.add(sph);
+    markerRef.current = sph;
+  }
 
-    # 4) marcador (centro del espesor)
-    xs = SENSOR_X_FRACTION * L
-    k_near = min(range(N + 1), key=lambda ii: abs(L * ii / N - xs))
-    z_marker = w_def[k_near] * DEF_SCALE
-    marker = [xs, 0.0, z_marker]
-
-    max_mm = max(abs(v) for v in w_def) * 1000.0
-
-    return vertices, indices, u_mag, marker, max_mm
-
-def run_once(db, clientid):
-    now = datetime.now(timezone.utc)
-    vertices, indices, u_mag, marker, max_mm = build_viz()
-
-    db["simulation_result"].insert_one({
-        "clientid": clientid,
-        "status": "done",
-        "ts": now,
-        "model": { "type": "beam_demo", "L_m": L, "B_m": B, "H_m": H, "E_Pa": E, "q_Npm": q },
-        "params": {},
-        "viz": { "vertices": vertices, "indices": indices, "u_mag": u_mag, "marker": marker }
-    })
-
-    db["simulation_ts"].insert_one({ "ts": now, "clientid": clientid, "fem_mm": float(max_mm) })
-
-def main():
-    db = mongo()
-    ensure_indexes(db)
-    print(f"[worker] starting… clients={CLIENTS} every {INTERVAL_S}s")
-    while True:
-        for cid in CLIENTS:
-            try:
-                run_once(db, cid)
-            except Exception as e:
-                print("[worker] error:", e)
-        time.sleep(INTERVAL_S)
-
-if __name__ == "__main__":
-    main()
-
+  return (
+    <div
+      ref={wrapRef}
+      style={{ width: "100%", height, position: "relative", borderRadius: 12, overflow: "hidden" }}
+    >
+      {/* Botón FIT */}
+      <button
+        onClick={() => meshRef.current && frameObject(meshRef.current)}
+        style={{
+          position: "absolute",
+          right: 8,
+          bottom: 8,
+          fontSize: 12,
+          padding: "4px 8px",
+          background: "rgba(255,255,255,0.08)",
+          border: "1px solid rgba(255,255,255,0.2)",
+          color: "#fff",
+          borderRadius: 6,
+          backdropFilter: "blur(4px)",
+          cursor: "pointer",
+        }}
+      >
+        Fit
+      </button>
+    </div>
+  );
+}
 
 
 
