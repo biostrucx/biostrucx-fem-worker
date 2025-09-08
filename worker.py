@@ -16,7 +16,7 @@ CLIENTS     = [c.strip() for c in os.getenv("FEM_CLIENTS", "jeimie").split(",") 
 INTERVAL_S  = int(os.getenv("FEM_INTERVAL_SEC", "120"))
 
 # Geometría / propiedades (m, Pa, N/m)
-L = float(os.getenv("FEM_L", "15.0"))
+L = float(os.getenv("FEM_L", "25"))
 B = float(os.getenv("FEM_B", "0.25"))      # ancho (eje y)
 H = float(os.getenv("FEM_H", "0.30"))       # “espesor” visual (altura)
 E = float(os.getenv("FEM_E", str(30e9)))
