@@ -18,7 +18,7 @@ INTERVAL_S  = int(os.getenv("FEM_INTERVAL_SEC", "120"))
 # Geometría / propiedades (m, Pa, N/m)
 # 👉 Ahora valores fijos (ignora ENV)
 # =============================
-L = 25.0       # longitud de la viga (m)
+L = 1.0       # longitud de la viga (m)
 B = 0.30       # ancho (m)  ← cambia aquí para probar
 H = 0.45       # altura/espesor (m)
 E = 30e9       # módulo de Young (Pa)
