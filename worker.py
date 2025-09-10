@@ -17,8 +17,8 @@ INTERVAL_S  = int(os.getenv("FEM_INTERVAL_SEC", "120"))
 
 # Geometría / propiedades (m, Pa, N/m)
 L = float(os.getenv("FEM_L", "5.0"))
-B = float(os.getenv("FEM_B", "0.55"))      # ancho (eje y)
-H = float(os.getenv("FEM_H", "0.50"))       # “espesor” visual (altura)
+B = float(os.getenv("FEM_B", "0.25"))      # ancho (eje y)
+H = float(os.getenv("FEM_H", "0.30"))       # “espesor” visual (altura)
 E = float(os.getenv("FEM_E", str(30e9)))
 rho = 2500.0
 q_kNpm = float(os.getenv("FEM_W", "15"))
